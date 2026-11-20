@@ -14,29 +14,75 @@ SECRET = os.environ["AUTH_SECRET"].strip()
 CONFIRM = os.getenv("CONFIRM_PROFILE", "").strip()
 APPLY = os.getenv("APPLY_CLEANUP") == "true"
 
+
 def api(method, path, payload=None):
     body = None
     headers = {"X-Api-Key": SECRET}
-    if payload is not None:
-        body = json.dumps(payload).encode()
-        headers["Content-Type"] = "application/json"
-    req = Request(BASE + path, data=body,
-                  headers=headers, method=method)
-    try:
-        with urlopen(req, timeout=40) as r:
-            raw = r.read()
-            result = json.loads(raw) if raw else {}
-    except HTTPError as e:
-        detail = e.read().decode(errors="replace")
-        raise RuntimeError(
-            f"{method} failed: HTTP {e.code}: {detail}"
-        ) from e
-    except URLError as e:
-        raise RuntimeError(f"Network error: {e.reason}") from e
 
-    if isinstance(result, dict) and result.get("errors"):
-        raise RuntimeError(f"API errors: {result['errors']}")
-    return result
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    max_attempts = 12
+
+    for attempt in range(max_attempts):
+        req = Request(
+            BASE + path,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+
+        try:
+            with urlopen(req, timeout=40) as r:
+                raw = r.read()
+                result = json.loads(raw) if raw else {}
+
+            if isinstance(result, dict) and result.get("errors"):
+                raise RuntimeError(
+                    f"NextDNS API errors: {result['errors']}"
+                )
+
+            return result
+
+        except HTTPError as e:
+            detail = e.read().decode(errors="replace")
+
+            if e.code == 429:
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        "NextDNS rate limit persisted "
+                        "after all retries"
+                    ) from e
+
+                retry_after = e.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after)
+                    if not 1 <= wait <= 600:
+                        wait = 60
+                except (TypeError, ValueError):
+                    wait = min(60 * (attempt + 1), 180)
+
+                print(
+                    f"Rate limit reached. "
+                    f"Waiting {wait:.0f} seconds "
+                    f"(retry {attempt + 1}/{max_attempts - 1})",
+                    flush=True,
+                )
+
+                time.sleep(wait)
+                continue
+
+            raise RuntimeError(
+                f"{method} failed: HTTP {e.code}: {detail}"
+            ) from e
+
+        except URLError as e:
+            raise RuntimeError(
+                f"Network error: {e.reason}"
+            ) from e
+
+    raise RuntimeError("NextDNS API retries exhausted")
 
 
 def get_all_rewrites():
@@ -146,7 +192,7 @@ def main():
         api("DELETE", f"/profiles/{PROFILE}/rewrites/{rid}")
         if index % 25 == 0:
             print(f"Deleted {index}/{len(obsolete)}")
-        time.sleep(0.15)
+        time.sleep(1)
 
     # Add desired records
     for index, (name, ip) in enumerate(additions.items(), 1):
@@ -154,7 +200,7 @@ def main():
             {"name": name, "content": ip})
         if index % 10 == 0:
             print(f"Added {index}/{len(additions)}")
-        time.sleep(0.15)
+        time.sleep(1)
 
     # Verify final state
     final = get_all_rewrites()

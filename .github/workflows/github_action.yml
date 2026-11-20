@@ -5,6 +5,12 @@ on:
   schedule:
     - cron: '30 1 * * *'
   workflow_dispatch:
+    inputs:
+      apply_changes:
+        description: "Apply changes to NextDNS"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +38,15 @@ jobs:
         run: |
           python3 filter_hosts.py
           wc -l filtered-hosts
+          grep -E ' (chatgpt\.com|auth\.openai\.com)$' filtered-hosts
+
+      - name: Upload generated hosts
+        uses: actions/upload-artifact@v4
+        with:
+          name: filtered-hosts
+          path: filtered-hosts
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Verify and backup NextDNS
         env:
@@ -47,6 +62,11 @@ jobs:
           if-no-files-found: error
 
       - name: Synchronize NextDNS
+        if: >-
+          ${{
+            github.event_name == 'schedule' ||
+            inputs.apply_changes == true
+          }}
         env:
           APPLY_CLEANUP: "true"
           CONFIRM_PROFILE: ${{ secrets.CLIENT_ID }}

@@ -41,7 +41,7 @@ for line in lines:
     except ValueError:
         continue
     for host in hosts:
-        host = host.lower().rstrip(".")
+        host = host.lower().replace("\\.", ".").rstrip(".")
         if allowed(host) and host not in result:
             result[host] = ip
 

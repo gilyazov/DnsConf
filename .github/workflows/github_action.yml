@@ -51,7 +51,7 @@ jobs:
           wc -l filtered-hosts
           cat filtered-hosts
 
-      - name: Run application
-        run: |
-          echo "Starting application..."
-          java --enable-preview -jar target/*.jar
+      # - name: Run application
+      #   run: |
+      #     echo "Starting application..."
+      #     java --enable-preview -jar target/*.jar

@@ -51,6 +51,11 @@ jobs:
           echo "Total records:"
           wc -l filtered-hosts
 
+      - name: Preview NextDNS cleanup
+        env:
+          APPLY_CLEANUP: "false"
+        run: python3 cleanup_nextdns.py
+
       - name: Publish filtered hosts
         run: |
           git config user.name "github-actions[bot]"

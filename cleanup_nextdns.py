@@ -1,84 +1,178 @@
 
 import os
 import json
-import sys
+import time
+import ipaddress
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.parse import urlencode, quote
+from urllib.error import HTTPError, URLError
 
-API = "https://api.nextdns.io"
-PROFILE = os.environ["CLIENT_ID"]
-SECRET = os.environ["AUTH_SECRET"]
+BASE = "https://api.nextdns.io"
+PROFILE = os.environ["CLIENT_ID"].strip()
+SECRET = os.environ["AUTH_SECRET"].strip()
+CONFIRM = os.getenv("CONFIRM_PROFILE", "").strip()
 APPLY = os.getenv("APPLY_CLEANUP") == "true"
 
-def request(method, path):
-    req = Request(
-        API + path,
-        headers={"X-Api-Key": SECRET},
-        method=method,
-    )
+def api(method, path, payload=None):
+    body = None
+    headers = {"X-Api-Key": SECRET}
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = Request(BASE + path, data=body,
+                  headers=headers, method=method)
     try:
-        with urlopen(req, timeout=30) as response:
-            body = response.read()
-            return json.loads(body) if body else {}
+        with urlopen(req, timeout=40) as r:
+            raw = r.read()
+            result = json.loads(raw) if raw else {}
     except HTTPError as e:
-        print(f"NextDNS API error: {e.code}")
-        raise
+        detail = e.read().decode(errors="replace")
+        raise RuntimeError(
+            f"{method} failed: HTTP {e.code}: {detail}"
+        ) from e
+    except URLError as e:
+        raise RuntimeError(f"Network error: {e.reason}") from e
 
-# Load the desired records
-desired = {}
-for line in Path("filtered-hosts").read_text().splitlines():
-    parts = line.split()
-    if len(parts) != 2:
-        raise RuntimeError("Invalid filtered-hosts line")
-    ip, domain = parts
-    desired[domain] = ip
+    if isinstance(result, dict) and result.get("errors"):
+        raise RuntimeError(f"API errors: {result['errors']}")
+    return result
 
-if not 1 <= len(desired) <= 500:
-    raise RuntimeError("Invalid number of desired records")
+def get_all_rewrites():
+    items = []
+    cursor = None
+    seen = set()
+    while True:
+        params = {"limit": 500}
+        if cursor:
+            params["cursor"] = cursor
+        path = f"/profiles/{PROFILE}/rewrites?{urlencode(params)}"
+        response = api("GET", path)
+        page = response.get("data")
+        if not isinstance(page, list):
+            raise RuntimeError("Invalid rewrites response")
+        items.extend(page)
+        cursor = (
+            response.get("meta", {})
+            .get("pagination", {})
+            .get("cursor")
+        )
+        if not cursor:
+            break
+        if cursor in seen:
+            raise RuntimeError("Pagination loop detected")
+        seen.add(cursor)
+    return items
 
-if "chatgpt.com" not in desired:
-    raise RuntimeError("ChatGPT record missing")
+def load_desired():
+    desired = {}
+    for raw in Path("filtered-hosts").read_text().splitlines():
+        parts = raw.split()
+        if not parts:
+            continue
+        if len(parts) != 2:
+            raise RuntimeError(f"Invalid hosts line: {raw}")
+        ip, name = parts
+        ipaddress.ip_address(ip)
+        name = name.lower().rstrip(".")
+        if name.startswith("*.") or "\\" in name:
+            raise RuntimeError(f"Invalid domain: {name}")
+        if name in desired and desired[name] != ip:
+            raise RuntimeError(f"Duplicate domain: {name}")
+        desired[name] = ip
+    if not 1 <= len(desired) <= 500:
+        raise RuntimeError("Desired count outside 1..500")
+    if "chatgpt.com" not in desired:
+        raise RuntimeError("Missing chatgpt.com")
+    return desired
 
-# Get current rewrites
-response = request("GET", f"/profiles/{PROFILE}/rewrites")
-current = response["data"]
+def main():
+    if not PROFILE or not SECRET:
+        raise RuntimeError("Missing NextDNS credentials")
 
-if not isinstance(current, list):
-    raise RuntimeError("Unexpected API response")
+    # Confirm the actual target profile
+    profile = api("GET", f"/profiles/{PROFILE}")
+    info = profile.get("data", {})
+    if info.get("id") != PROFILE:
+        raise RuntimeError("Profile ID verification failed")
+    print("Verified NextDNS profile:", info.get("name"))
+    print("Profile ID:", PROFILE)
 
-# Save a backup of the current rules
-Path("rewrites-backup.json").write_text(
-    json.dumps(current, indent=2, ensure_ascii=False)
-)
+    desired = load_desired()
+    current = get_all_rewrites()
 
-keep = set(desired.items())
-obsolete = [
-    item for item in current
-    if (item.get("name"), item.get("content")) not in keep
-]
-
-print(f"Existing records: {len(current)}")
-print(f"Desired records: {len(desired)}")
-print(f"Records to remove: {len(obsolete)}")
-
-for item in obsolete:
-    print("REMOVE:", item.get("name"), item.get("content"))
-
-if not APPLY:
-    print("DRY RUN: nothing was deleted")
-    sys.exit(0)
-
-if os.getenv("CONFIRM_PROFILE") != PROFILE:
-    raise RuntimeError("Profile confirmation mismatch")
-
-for item in obsolete:
-    record_id = item.get("id")
-    if not record_id:
-        raise RuntimeError("Rewrite ID missing")
-    request(
-        "DELETE",
-        f"/profiles/{PROFILE}/rewrites/{record_id}"
+    # Backup before any modification
+    backup = {
+        "profile_id": PROFILE,
+        "profile_name": info.get("name"),
+        "rewrites": current
+    }
+    Path("rewrites-backup.json").write_text(
+        json.dumps(backup, indent=2, ensure_ascii=False)
     )
+    print("Backup saved")
 
-print("Cleanup completed")
+    # Keep only exact matches
+    matching = set()
+    obsolete = []
+    for item in current:
+        name = item.get("name")
+        content = item.get("content")
+        record_id = item.get("id")
+        if not isinstance(record_id, str) or not record_id:
+            raise RuntimeError("Rewrite ID missing")
+        if (name in desired and
+            desired[name] == content and
+            name not in matching):
+            matching.add(name)
+        else:
+            obsolete.append(item)
+
+    additions = {
+        name: ip for name, ip in desired.items()
+        if name not in matching
+    }
+
+    print("Existing:", len(current))
+    print("Desired:", len(desired))
+    print("To delete:", len(obsolete))
+    print("To add:", len(additions))
+
+    if not APPLY:
+        print("DRY RUN - no changes made")
+        return
+
+    if CONFIRM != PROFILE:
+        raise RuntimeError("Profile confirmation mismatch")
+
+    # Delete obsolete records
+    for index, item in enumerate(obsolete, 1):
+        rid = quote(item["id"], safe="")
+        api("DELETE", f"/profiles/{PROFILE}/rewrites/{rid}")
+        if index % 25 == 0:
+            print(f"Deleted {index}/{len(obsolete)}")
+        time.sleep(0.15)
+
+    # Add desired records
+    for index, (name, ip) in enumerate(additions.items(), 1):
+        api("POST", f"/profiles/{PROFILE}/rewrites",
+            {"name": name, "content": ip})
+        if index % 10 == 0:
+            print(f"Added {index}/{len(additions)}")
+        time.sleep(0.15)
+
+    # Verify final state
+    final = get_all_rewrites()
+    actual = {(x["name"], x["content"]) for x in final}
+    expected = set(desired.items())
+
+    if actual != expected or len(final) != len(desired):
+        raise RuntimeError(
+            "Final verification failed; inspect backup"
+        )
+
+    print("SUCCESS: NextDNS rewrites synchronized")
+    print("Final record count:", len(final))
+
+if __name__ == "__main__":
+    main()

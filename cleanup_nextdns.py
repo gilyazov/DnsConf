@@ -38,30 +38,25 @@ def api(method, path, payload=None):
         raise RuntimeError(f"API errors: {result['errors']}")
     return result
 
+
 def get_all_rewrites():
-    items = []
-    cursor = None
-    seen = set()
-    while True:
-        params = {"limit": 500}
-        if cursor:
-            params["cursor"] = cursor
-        path = f"/profiles/{PROFILE}/rewrites?{urlencode(params)}"
-        response = api("GET", path)
-        page = response.get("data")
-        if not isinstance(page, list):
-            raise RuntimeError("Invalid rewrites response")
-        items.extend(page)
-        cursor = (
-            response.get("meta", {})
-            .get("pagination", {})
-            .get("cursor")
+    response = api(
+        "GET",
+        f"/profiles/{PROFILE}/rewrites"
+    )
+
+    items = response.get("data")
+
+    if not isinstance(items, list):
+        raise RuntimeError(
+            "Invalid NextDNS rewrites response"
         )
-        if not cursor:
-            break
-        if cursor in seen:
-            raise RuntimeError("Pagination loop detected")
-        seen.add(cursor)
+
+    if len(items) > 500:
+        raise RuntimeError(
+            "Unexpected rewrite count over 500"
+        )
+
     return items
 
 def load_desired():

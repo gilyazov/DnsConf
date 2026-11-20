@@ -1,9 +1,9 @@
-
 name: DNS Block&Redirect Configurer cron task
 
 on:
   schedule:
     - cron: '30 1 * * *'
+
   workflow_dispatch:
     inputs:
       apply_changes:
